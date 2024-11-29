@@ -45,8 +45,13 @@ jobs:
             "quay.io/opendatahub/kubeflow-notebook-controller:1.9-${GIT_HASH}"
             "quay.io/opendatahub/odh-notebook-controller:1.9-${GIT_HASH}"
           )
-          # Poll for image readiness total timeout=15m
-          MAX_ATTEMPTS=10
+
+          # Sleep for 5 minutes before starting polling
+          echo "Sleeping for 5 minutes before starting polling..."
+          sleep 300
+
+          # Poll for image readiness total timeout=20m
+          MAX_ATTEMPTS=13
           SLEEP_DURATION=90
           for image in "${IMAGES[@]}"; do
             for (( i=1; i<=MAX_ATTEMPTS; i++ )); do
@@ -105,9 +110,9 @@ jobs:
             exit 1
           fi
 
-          # Polling loop to wait for the PR to be merged total timeout=1h
-          MAX_ATTEMPTS=10
-          SLEEP_DURATION=360
+          # Polling loop to wait for the PR to be merged total timeout=5h
+          MAX_ATTEMPTS=30
+          SLEEP_DURATION=600
 
           for (( i=1; i<=MAX_ATTEMPTS; i++ )); do
             echo "Checking if PR #$PR_NUMBER is merged (Attempt $i/$MAX_ATTEMPTS)..."
