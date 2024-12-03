@@ -3,6 +3,9 @@ name: Code static analysis
 "on":
   push:
   pull_request:
+    branches:
+      - main
+      - v1.9-branch
   workflow_dispatch:
 
 permissions:

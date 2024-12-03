@@ -2,6 +2,9 @@ name: Notebook Controller Integration Test
 on:
   push:
   pull_request:
+    branches:
+      - main
+      - v1.9-branch
     paths:
       - components/notebook-controller/**
   workflow_dispatch:
