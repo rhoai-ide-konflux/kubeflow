@@ -134,10 +134,10 @@ jobs:
           echo "pr_merged=false" >> $GITHUB_OUTPUT
           exit 1
 
-  # 5. Create a release (Mock-Up workflow it will be fullfill by RHOAIENG-15391)
+  # 5. Create a release 
   create-release:
     needs: [update-release-images, check-pr-merged]
     if: ${{ needs.check-pr-merged.outputs.pr_merged == 'true' && inputs.create-new-release == 'true' }}
     uses: opendatahub-io/kubeflow/.github/workflows/create-release.yaml@main
     with:
-      input_var: "Eyo"
+      target_branch: "v1.9-branch"
