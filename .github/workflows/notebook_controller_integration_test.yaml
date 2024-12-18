@@ -2,7 +2,11 @@ name: Notebook Controller Integration Test
 on:
   push:
   pull_request:
+    branches:
+      - main
+      - v1.9-branch
     paths:
+      - .github/workflows/notebook_controller_integration_test.yaml
       - components/notebook-controller/**
   workflow_dispatch:
 

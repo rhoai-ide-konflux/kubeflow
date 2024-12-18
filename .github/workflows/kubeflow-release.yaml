@@ -3,12 +3,16 @@ name: Kubeflow Release Pipeline
 on:
   workflow_dispatch:
     inputs:
-      create-new-release:
-        description: "Create a new release?"
+      release-type:
+        description: "Select the type of action to perform"
         required: true
-        default: "true"
+        default: "Sync"
+        type: choice
+        options:
+          - Sync
+          - Release
 env:
-  CREATE_NEW_RELEASE: ${{ inputs.create-new-release }}
+  CREATE_NEW_RELEASE: ${{ inputs.release-type == 'Release' }}
   REPO_OWNER: opendatahub-io
   REPO_NAME: kubeflow
   BRANCH_NAME: v1.9-branch
@@ -45,8 +49,13 @@ jobs:
             "quay.io/opendatahub/kubeflow-notebook-controller:1.9-${GIT_HASH}"
             "quay.io/opendatahub/odh-notebook-controller:1.9-${GIT_HASH}"
           )
-          # Poll for image readiness total timeout=15m
-          MAX_ATTEMPTS=10
+
+          # Sleep for 5 minutes before starting polling
+          echo "Sleeping for 5 minutes before starting polling..."
+          sleep 300
+
+          # Poll for image readiness total timeout=20m
+          MAX_ATTEMPTS=13
           SLEEP_DURATION=90
           for image in "${IMAGES[@]}"; do
             for (( i=1; i<=MAX_ATTEMPTS; i++ )); do
@@ -78,6 +87,8 @@ jobs:
       branch-name: "v1.9-branch"
       organization: "opendatahub-io"
       generate-pr: "true"
+    secrets:
+      GH_TOKEN: ${{ secrets.GHA_SECRET_PAT }}
 
   # 4. Check PR merged status
   check-pr-merged:
@@ -105,9 +116,9 @@ jobs:
             exit 1
           fi
 
-          # Polling loop to wait for the PR to be merged total timeout=1h
-          MAX_ATTEMPTS=10
-          SLEEP_DURATION=360
+          # Polling loop to wait for the PR to be merged total timeout=5h
+          MAX_ATTEMPTS=30
+          SLEEP_DURATION=600
 
           for (( i=1; i<=MAX_ATTEMPTS; i++ )); do
             echo "Checking if PR #$PR_NUMBER is merged (Attempt $i/$MAX_ATTEMPTS)..."
@@ -129,10 +140,10 @@ jobs:
           echo "pr_merged=false" >> $GITHUB_OUTPUT
           exit 1
 
-  # 5. Create a release (Mock-Up workflow it will be fullfill by RHOAIENG-15391)
+  # 5. Create a release
   create-release:
     needs: [update-release-images, check-pr-merged]
-    if: ${{ needs.check-pr-merged.outputs.pr_merged == 'true' && inputs.create-new-release == 'true' }}
+    if: ${{ needs.check-pr-merged.outputs.pr_merged == 'true' && inputs.release-type == 'Release' }}
     uses: opendatahub-io/kubeflow/.github/workflows/create-release.yaml@main
     with:
-      input_var: "Eyo"
+      target_branch: "v1.9-branch"
