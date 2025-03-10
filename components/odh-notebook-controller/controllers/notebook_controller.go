@@ -57,8 +57,9 @@ const (
 // OpenshiftNotebookReconciler holds the controller configuration.
 type OpenshiftNotebookReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-	Log    logr.Logger
+	Namespace string
+	Scheme    *runtime.Scheme
+	Log       logr.Logger
 }
 
 // ClusterRole permissions
@@ -72,6 +73,7 @@ type OpenshiftNotebookReconciler struct {
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="image.openshift.io",resources=imagestreams,verbs=list;get
 
 // CompareNotebooks checks if two notebooks are equal, if not return false.
 func CompareNotebooks(nb1 nbv1.Notebook, nb2 nbv1.Notebook) bool {
@@ -283,6 +285,9 @@ func (r *OpenshiftNotebookReconciler) CreateNotebookCertConfigMap(notebook *nbv1
 		for _, certFile := range configMapFileNames[configMapName] {
 
 			certData, ok := configMap.Data[certFile]
+			// RHOAIENG-15743: opendatahub-operator#1339 started adding '\n' unconditionally, which
+			// is breaking our `== ""` checks below. Trim the certData again.
+			certData = strings.TrimSpace(certData)
 			// If ca-bundle.crt is not found in the ConfigMap odh-trusted-ca-bundle
 			// no need to create the workbench-trusted-ca-bundle, as it is created
 			// by annotation inject-ca-bundle: "true"

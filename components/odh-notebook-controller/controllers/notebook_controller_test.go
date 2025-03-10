@@ -20,25 +20,22 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
-	"io/ioutil"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/onsi/gomega/format"
+	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/gomega"
+
+	routev1 "github.com/openshift/api/route/v1"
+	corev1 "k8s.io/api/core/v1"
 	netv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
-	routev1 "github.com/openshift/api/route/v1"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	nbv1 "github.com/kubeflow/kubeflow/components/notebook-controller/api/v1"
@@ -72,7 +69,7 @@ var _ = Describe("The Openshift Notebook controller", func() {
 				To: routev1.RouteTargetReference{
 					Kind:   "Service",
 					Name:   Name,
-					Weight: pointer.Int32Ptr(100),
+					Weight: ptr.To[int32](100),
 				},
 				Port: &routev1.RoutePort{
 					TargetPort: intstr.FromString("http-" + Name),
@@ -102,7 +99,7 @@ var _ = Describe("The Openshift Notebook controller", func() {
 				key := types.NamespacedName{Name: Name, Namespace: Namespace}
 				return cli.Get(ctx, key, route)
 			}, duration, interval).Should(Succeed())
-			Expect(CompareNotebookRoutes(*route, expectedRoute)).Should(BeTrue())
+			Expect(*route).To(BeMatchingK8sResource(expectedRoute, CompareNotebookRoutes))
 		})
 
 		It("Should reconcile the Route when modified", func() {
@@ -120,7 +117,7 @@ var _ = Describe("The Openshift Notebook controller", func() {
 				}
 				return route.Spec.To.Name, nil
 			}, duration, interval).Should(Equal(Name))
-			Expect(CompareNotebookRoutes(*route, expectedRoute)).Should(BeTrue())
+			Expect(*route).To(BeMatchingK8sResource(expectedRoute, CompareNotebookRoutes))
 		})
 
 		It("Should recreate the Route when deleted", func() {
@@ -133,7 +130,7 @@ var _ = Describe("The Openshift Notebook controller", func() {
 				key := types.NamespacedName{Name: Name, Namespace: Namespace}
 				return cli.Get(ctx, key, route)
 			}, duration, interval).Should(Succeed())
-			Expect(CompareNotebookRoutes(*route, expectedRoute)).Should(BeTrue())
+			Expect(*route).To(BeMatchingK8sResource(expectedRoute, CompareNotebookRoutes))
 		})
 
 		It("Should delete the Openshift Route", func() {
@@ -146,8 +143,8 @@ var _ = Describe("The Openshift Notebook controller", func() {
 				Kind:               "Notebook",
 				Name:               Name,
 				UID:                notebook.GetObjectMeta().GetUID(),
-				Controller:         pointer.BoolPtr(true),
-				BlockOwnerDeletion: pointer.BoolPtr(true),
+				Controller:         ptr.To(true),
+				BlockOwnerDeletion: ptr.To(true),
 			}
 
 			By("By checking that the Notebook owns the Route object")
@@ -297,7 +294,7 @@ var _ = Describe("The Openshift Notebook controller", func() {
 				VolumeSource: corev1.VolumeSource{
 					ConfigMap: &corev1.ConfigMapVolumeSource{
 						LocalObjectReference: corev1.LocalObjectReference{Name: workbenchTrustedCACertBundle},
-						Optional:             pointer.Bool(true),
+						Optional:             ptr.To(true),
 						Items: []corev1.KeyToPath{
 							{
 								Key:  "ca-bundle.crt",
@@ -403,7 +400,7 @@ var _ = Describe("The Openshift Notebook controller", func() {
 				VolumeSource: corev1.VolumeSource{
 					ConfigMap: &corev1.ConfigMapVolumeSource{
 						LocalObjectReference: corev1.LocalObjectReference{Name: workbenchTrustedCACertBundle},
-						Optional:             pointer.Bool(true),
+						Optional:             ptr.To(true),
 						Items: []corev1.KeyToPath{
 							{
 								Key:  "ca-bundle.crt",
@@ -432,12 +429,7 @@ var _ = Describe("The Openshift Notebook controller", func() {
 		notebook := createNotebook(Name, Namespace)
 
 		npProtocol := corev1.ProtocolTCP
-		testPodNamespace := "redhat-ods-applications"
-		if data, err := ioutil.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace"); err == nil {
-			if ns := strings.TrimSpace(string(data)); len(ns) > 0 {
-				testPodNamespace = ns
-			}
-		}
+		testPodNamespace := odhNotebookControllerTestNamespace
 
 		expectedNotebookNetworkPolicy := netv1.NetworkPolicy{
 			ObjectMeta: metav1.ObjectMeta{
@@ -462,9 +454,9 @@ var _ = Describe("The Openshift Notebook controller", func() {
 						},
 						From: []netv1.NetworkPolicyPeer{
 							{
-								// Since for unit tests we do not have context,
-								// namespace will fallback to test pod namespace
-								// if run in CI or `redhat-ods-applications` if run locally
+								// Since for unit tests the controller does not run in a cluster pod,
+								// it cannot detect its own pod's namespace. Therefore, we define it
+								// to be `redhat-ods-applications` (in suite_test.go)
 								NamespaceSelector: &metav1.LabelSelector{
 									MatchLabels: map[string]string{
 										"kubernetes.io/metadata.name": testPodNamespace,
@@ -497,15 +489,14 @@ var _ = Describe("The Openshift Notebook controller", func() {
 				key := types.NamespacedName{Name: Name + "-ctrl-np", Namespace: Namespace}
 				return cli.Get(ctx, key, notebookNetworkPolicy)
 			}, duration, interval).Should(Succeed())
-			Expect(CompareNotebookNetworkPolicies(*notebookNetworkPolicy, expectedNotebookNetworkPolicy)).Should(BeTrue())
+			Expect(*notebookNetworkPolicy).To(BeMatchingK8sResource(expectedNotebookNetworkPolicy, CompareNotebookNetworkPolicies))
 
 			By("By checking that the controller has created Network policy to allow all requests on OAuth port")
 			Eventually(func() error {
 				key := types.NamespacedName{Name: Name + "-oauth-np", Namespace: Namespace}
 				return cli.Get(ctx, key, notebookOAuthNetworkPolicy)
 			}, duration, interval).Should(Succeed())
-			Expect(CompareNotebookNetworkPolicies(*notebookOAuthNetworkPolicy, expectedNotebookOAuthNetworkPolicy)).
-				To(BeTrue(), "Expected :%v\n, Got: %v", format.Object(expectedNotebookOAuthNetworkPolicy, 1), format.Object(notebookOAuthNetworkPolicy, 1))
+			Expect(*notebookOAuthNetworkPolicy).To(BeMatchingK8sResource(expectedNotebookOAuthNetworkPolicy, CompareNotebookNetworkPolicies))
 		})
 
 		It("Should reconcile the Network policies when modified", func() {
@@ -523,7 +514,7 @@ var _ = Describe("The Openshift Notebook controller", func() {
 				}
 				return string(notebookNetworkPolicy.Spec.PolicyTypes[0]), nil
 			}, duration, interval).Should(Equal("Ingress"))
-			Expect(CompareNotebookNetworkPolicies(*notebookNetworkPolicy, expectedNotebookNetworkPolicy)).Should(BeTrue())
+			Expect(*notebookNetworkPolicy).To(BeMatchingK8sResource(expectedNotebookNetworkPolicy, CompareNotebookNetworkPolicies))
 		})
 
 		It("Should recreate the Network Policy when deleted", func() {
@@ -536,7 +527,7 @@ var _ = Describe("The Openshift Notebook controller", func() {
 				key := types.NamespacedName{Name: Name + "-oauth-np", Namespace: Namespace}
 				return cli.Get(ctx, key, notebookOAuthNetworkPolicy)
 			}, duration, interval).Should(Succeed())
-			Expect(CompareNotebookNetworkPolicies(*notebookOAuthNetworkPolicy, expectedNotebookOAuthNetworkPolicy)).Should(BeTrue())
+			Expect(*notebookOAuthNetworkPolicy).To(BeMatchingK8sResource(expectedNotebookOAuthNetworkPolicy, CompareNotebookNetworkPolicies))
 		})
 
 		It("Should delete the Network Policies", func() {
@@ -545,8 +536,8 @@ var _ = Describe("The Openshift Notebook controller", func() {
 				Kind:               "Notebook",
 				Name:               Name,
 				UID:                notebook.GetObjectMeta().GetUID(),
-				Controller:         pointer.BoolPtr(true),
-				BlockOwnerDeletion: pointer.BoolPtr(true),
+				Controller:         ptr.To(true),
+				BlockOwnerDeletion: ptr.To(true),
 			}
 
 			By("By checking that the Notebook owns the Notebook Network Policy object")
@@ -642,7 +633,7 @@ var _ = Describe("The Openshift Notebook controller", func() {
 								VolumeSource: corev1.VolumeSource{
 									Secret: &corev1.SecretVolumeSource{
 										SecretName:  Name + "-oauth-config",
-										DefaultMode: pointer.Int32Ptr(420),
+										DefaultMode: ptr.To[int32](420),
 									},
 								},
 							},
@@ -651,7 +642,7 @@ var _ = Describe("The Openshift Notebook controller", func() {
 								VolumeSource: corev1.VolumeSource{
 									Secret: &corev1.SecretVolumeSource{
 										SecretName:  Name + "-tls",
-										DefaultMode: pointer.Int32Ptr(420),
+										DefaultMode: ptr.To[int32](420),
 									},
 								},
 							},
@@ -669,20 +660,17 @@ var _ = Describe("The Openshift Notebook controller", func() {
 			time.Sleep(interval)
 
 			By("By checking that the webhook has injected the sidecar container")
-			Expect(CompareNotebooks(*notebook, expectedNotebook)).Should(BeTrue())
+			Expect(*notebook).To(BeMatchingK8sResource(expectedNotebook, CompareNotebooks))
 		})
 
 		It("Should remove the reconciliation lock annotation", func() {
 			By("By checking that the annotation lock annotation is not present")
 			delete(expectedNotebook.Annotations, culler.STOP_ANNOTATION)
-			Eventually(func() bool {
+			Eventually(func() (nbv1.Notebook, error) {
 				key := types.NamespacedName{Name: Name, Namespace: Namespace}
 				err := cli.Get(ctx, key, notebook)
-				if err != nil {
-					return false
-				}
-				return CompareNotebooks(*notebook, expectedNotebook)
-			}, duration, interval).Should(BeTrue())
+				return *notebook, err
+			}, duration, interval).Should(BeMatchingK8sResource(expectedNotebook, CompareNotebooks))
 		})
 
 		It("Should reconcile the Notebook when modified", func() {
@@ -698,7 +686,7 @@ var _ = Describe("The Openshift Notebook controller", func() {
 				key := types.NamespacedName{Name: Name, Namespace: Namespace}
 				return cli.Get(ctx, key, notebook)
 			}, duration, interval).Should(Succeed())
-			Expect(CompareNotebooks(*notebook, expectedNotebook)).Should(BeTrue())
+			Expect(*notebook).To(BeMatchingK8sResource(expectedNotebook, CompareNotebooks))
 		})
 
 		serviceAccount := &corev1.ServiceAccount{}
@@ -710,7 +698,7 @@ var _ = Describe("The Openshift Notebook controller", func() {
 				key := types.NamespacedName{Name: Name, Namespace: Namespace}
 				return cli.Get(ctx, key, serviceAccount)
 			}, duration, interval).Should(Succeed())
-			Expect(CompareNotebookServiceAccounts(*serviceAccount, expectedServiceAccount)).Should(BeTrue())
+			Expect(*serviceAccount).To(BeMatchingK8sResource(expectedServiceAccount, CompareNotebookServiceAccounts))
 		})
 
 		It("Should recreate the Service Account when deleted", func() {
@@ -723,7 +711,7 @@ var _ = Describe("The Openshift Notebook controller", func() {
 				key := types.NamespacedName{Name: Name, Namespace: Namespace}
 				return cli.Get(ctx, key, serviceAccount)
 			}, duration, interval).Should(Succeed())
-			Expect(CompareNotebookServiceAccounts(*serviceAccount, expectedServiceAccount)).Should(BeTrue())
+			Expect(*serviceAccount).To(BeMatchingK8sResource(expectedServiceAccount, CompareNotebookServiceAccounts))
 		})
 
 		service := &corev1.Service{}
@@ -754,7 +742,7 @@ var _ = Describe("The Openshift Notebook controller", func() {
 				key := types.NamespacedName{Name: Name + "-tls", Namespace: Namespace}
 				return cli.Get(ctx, key, service)
 			}, duration, interval).Should(Succeed())
-			Expect(CompareNotebookServices(*service, expectedService)).Should(BeTrue())
+			Expect(*service).To(BeMatchingK8sResource(expectedService, CompareNotebookServices))
 		})
 
 		It("Should recreate the Service when deleted", func() {
@@ -767,7 +755,7 @@ var _ = Describe("The Openshift Notebook controller", func() {
 				key := types.NamespacedName{Name: Name + "-tls", Namespace: Namespace}
 				return cli.Get(ctx, key, service)
 			}, duration, interval).Should(Succeed())
-			Expect(CompareNotebookServices(*service, expectedService)).Should(BeTrue())
+			Expect(*service).To(BeMatchingK8sResource(expectedService, CompareNotebookServices))
 		})
 
 		secret := &corev1.Secret{}
@@ -808,7 +796,7 @@ var _ = Describe("The Openshift Notebook controller", func() {
 				To: routev1.RouteTargetReference{
 					Kind:   "Service",
 					Name:   Name + "-tls",
-					Weight: pointer.Int32Ptr(100),
+					Weight: ptr.To[int32](100),
 				},
 				Port: &routev1.RoutePort{
 					TargetPort: intstr.FromString(OAuthServicePortName),
@@ -830,7 +818,7 @@ var _ = Describe("The Openshift Notebook controller", func() {
 				key := types.NamespacedName{Name: Name, Namespace: Namespace}
 				return cli.Get(ctx, key, route)
 			}, duration, interval).Should(Succeed())
-			Expect(CompareNotebookRoutes(*route, expectedRoute)).Should(BeTrue())
+			Expect(*route).To(BeMatchingK8sResource(expectedRoute, CompareNotebookRoutes))
 		})
 
 		It("Should recreate the Route when deleted", func() {
@@ -843,7 +831,7 @@ var _ = Describe("The Openshift Notebook controller", func() {
 				key := types.NamespacedName{Name: Name, Namespace: Namespace}
 				return cli.Get(ctx, key, route)
 			}, duration, interval).Should(Succeed())
-			Expect(CompareNotebookRoutes(*route, expectedRoute)).Should(BeTrue())
+			Expect(*route).To(BeMatchingK8sResource(expectedRoute, CompareNotebookRoutes))
 		})
 
 		It("Should reconcile the Route when modified", func() {
@@ -861,7 +849,7 @@ var _ = Describe("The Openshift Notebook controller", func() {
 				}
 				return route.Spec.To.Name, nil
 			}, duration, interval).Should(Equal(Name + "-tls"))
-			Expect(CompareNotebookRoutes(*route, expectedRoute)).Should(BeTrue())
+			Expect(*route).To(BeMatchingK8sResource(expectedRoute, CompareNotebookRoutes))
 		})
 
 		It("Should delete the OAuth proxy objects", func() {
@@ -874,8 +862,8 @@ var _ = Describe("The Openshift Notebook controller", func() {
 				Kind:               "Notebook",
 				Name:               Name,
 				UID:                notebook.GetObjectMeta().GetUID(),
-				Controller:         pointer.BoolPtr(true),
-				BlockOwnerDeletion: pointer.BoolPtr(true),
+				Controller:         ptr.To(true),
+				BlockOwnerDeletion: ptr.To(true),
 			}
 
 			By("By checking that the Notebook owns the Service Account object")

@@ -78,6 +78,21 @@ Run the following command to execute them:
 make test
 ```
 
+Useful options for running tests (that are already included in the above `make` command) are
+
+| Option                     | Description                                                                                   |
+|----------------------------|-----------------------------------------------------------------------------------------------|
+| KUBEBUILDER_ASSETS        | Environment variable that specifies path to where Kubebuilder has downloaded envtest binaries |
+| -ginkgo.v -ginkgo.progress | Enables verbose output from Ginkgo                                                            |
+| -test.v                    | Enables verbose output from Go tests (*testing.T)                                             |
+
+The following environment variables are used to enable additional debug options for the tests
+
+| Environment variable   | Description                                                                                                                                  |
+|------------------------|----------------------------------------------------------------------------------------------------------------------------------------------|
+| DEBUG_WRITE_KUBECONFIG | Writes a Kubeconfig file to disk. It can be used with `kubectl` or `k9s` to examine the envtest cluster when test is paused on a breakpoint. |
+| DEBUG_WRITE_AUDITLOG   | Writes kube-apiserver auditlogs to disk. The config is in `envtest-audit-policy.yaml`, set the namespace of interest there.                  |
+
 ### Run locally
 
 Install the `notebooks.kubeflow.org` CRD from the [Kubeflow notebook

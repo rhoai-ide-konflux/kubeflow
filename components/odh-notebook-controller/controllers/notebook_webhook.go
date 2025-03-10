@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	configv1 "github.com/openshift/api/config/v1"
 	"net/http"
 	"sort"
 	"strings"
@@ -29,13 +30,14 @@ import (
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
@@ -49,7 +51,11 @@ type NotebookWebhook struct {
 	Config      *rest.Config
 	Decoder     *admission.Decoder
 	OAuthConfig OAuthConfig
+	// controller namespace
+	Namespace string
 }
+
+var proxyEnvVars = make(map[string]string, 3)
 
 // InjectReconciliationLock injects the kubeflow notebook controller culling
 // stop annotation to explicitly start the notebook pod when the ODH notebook
@@ -185,7 +191,7 @@ func InjectOAuthProxy(notebook *nbv1.Notebook, oauth OAuthConfig) error {
 		VolumeSource: corev1.VolumeSource{
 			Secret: &corev1.SecretVolumeSource{
 				SecretName:  notebook.Name + "-oauth-config",
-				DefaultMode: pointer.Int32Ptr(420),
+				DefaultMode: ptr.To[int32](420),
 			},
 		},
 	}
@@ -208,7 +214,7 @@ func InjectOAuthProxy(notebook *nbv1.Notebook, oauth OAuthConfig) error {
 		VolumeSource: corev1.VolumeSource{
 			Secret: &corev1.SecretVolumeSource{
 				SecretName:  notebook.Name + "-tls",
-				DefaultMode: pointer.Int32Ptr(420),
+				DefaultMode: ptr.To[int32](420),
 			},
 		},
 	}
@@ -226,6 +232,29 @@ func InjectOAuthProxy(notebook *nbv1.Notebook, oauth OAuthConfig) error {
 	// Set a dedicated service account, do not use default
 	notebook.Spec.Template.Spec.ServiceAccountName = notebook.Name
 	return nil
+}
+
+func (w *NotebookWebhook) ClusterWideProxyIsEnabled() bool {
+	proxyResourceList := &configv1.ProxyList{}
+	err := w.Client.List(context.TODO(), proxyResourceList)
+	if err != nil {
+		return false
+	}
+
+	for _, proxy := range proxyResourceList.Items {
+		if proxy.Name == "cluster" {
+			if proxy.Status.HTTPProxy != "" && proxy.Status.HTTPSProxy != "" &&
+				proxy.Status.NoProxy != "" {
+				// Update Proxy Env variables map
+				proxyEnvVars["HTTP_PROXY"] = proxy.Status.HTTPProxy
+				proxyEnvVars["HTTPS_PROXY"] = proxy.Status.HTTPSProxy
+				proxyEnvVars["NO_PROXY"] = proxy.Status.NoProxy
+				return true
+			}
+		}
+	}
+	return false
+
 }
 
 // Handle transforms the Notebook objects.
@@ -254,7 +283,7 @@ func (w *NotebookWebhook) Handle(ctx context.Context, req admission.Request) adm
 	// Check Imagestream Info both on create and update operations
 	if req.Operation == admissionv1.Create || req.Operation == admissionv1.Update {
 		// Check Imagestream Info
-		err = SetContainerImageFromRegistry(ctx, w.Config, notebook, log)
+		err = SetContainerImageFromRegistry(ctx, w.Config, notebook, log, w.Namespace)
 		if err != nil {
 			return admission.Errored(http.StatusInternalServerError, err)
 		}
@@ -272,6 +301,14 @@ func (w *NotebookWebhook) Handle(ctx context.Context, req admission.Request) adm
 			return admission.Denied(fmt.Sprintf("Cannot have both %s and %s set to true. Pick one.", AnnotationServiceMesh, AnnotationInjectOAuth))
 		}
 		err = InjectOAuthProxy(notebook, w.OAuthConfig)
+		if err != nil {
+			return admission.Errored(http.StatusInternalServerError, err)
+		}
+	}
+
+	// If cluster-wide-proxy is enabled add environment variables
+	if w.ClusterWideProxyIsEnabled() {
+		err = InjectProxyConfigEnvVars(notebook)
 		if err != nil {
 			return admission.Errored(http.StatusInternalServerError, err)
 		}
@@ -367,6 +404,57 @@ func (w *NotebookWebhook) maybeRestartRunningNotebook(ctx context.Context, req a
 	return mutatedNotebook, &UpdatesPending{Reason: diff}, nil
 }
 
+func InjectProxyConfigEnvVars(notebook *nbv1.Notebook) error {
+	notebookContainers := &notebook.Spec.Template.Spec.Containers
+	var imgContainer corev1.Container
+
+	// Update Notebook Image container with env variables from central cluster proxy config
+	for _, container := range *notebookContainers {
+		// Update notebook image container with env Variables
+		if container.Name == notebook.Name {
+			var newVars []corev1.EnvVar
+			imgContainer = container
+
+			for key, val := range proxyEnvVars {
+				keyExists := false
+				for _, env := range imgContainer.Env {
+					if key == env.Name {
+						keyExists = true
+						// Update if Proxy spec is updated
+						if env.Value != val {
+							env.Value = val
+						}
+					}
+				}
+				if !keyExists {
+					newVars = append(newVars, corev1.EnvVar{Name: key, Value: val})
+				}
+			}
+
+			// Update container only when required env variables are not present
+			imgContainerExists := false
+			if len(newVars) != 0 {
+				imgContainer.Env = append(imgContainer.Env, newVars...)
+			}
+
+			// Update container with Proxy Env Changes
+			for index, container := range *notebookContainers {
+				if container.Name == notebook.Name {
+					(*notebookContainers)[index] = imgContainer
+					imgContainerExists = true
+					break
+				}
+			}
+
+			if !imgContainerExists {
+				return fmt.Errorf("notebook image container not found %v", notebook.Name)
+			}
+			break
+		}
+	}
+	return nil
+}
+
 // CheckAndMountCACertBundle checks if the odh-trusted-ca-bundle ConfigMap is present
 func CheckAndMountCACertBundle(ctx context.Context, cli client.Client, notebook *nbv1.Notebook, log logr.Logger) error {
 
@@ -444,7 +532,7 @@ func InjectCertConfig(notebook *nbv1.Notebook, configMapName string) error {
 				LocalObjectReference: corev1.LocalObjectReference{
 					Name: configMapName,
 				},
-				Optional: pointer.Bool(true),
+				Optional: ptr.To(true),
 				Items: []corev1.KeyToPath{{
 					Key:  configMapMountKey,
 					Path: configMapMountValue,
@@ -536,18 +624,12 @@ func InjectCertConfig(notebook *nbv1.Notebook, configMapName string) error {
 // If an internal registry is detected, it uses the default values specified in the Notebook Custom Resource (CR).
 // Otherwise, it checks the last-image-selection annotation to find the image stream and fetches the image from status.dockerImageReference,
 // assigning it to the container.image value.
-func SetContainerImageFromRegistry(ctx context.Context, config *rest.Config, notebook *nbv1.Notebook, log logr.Logger) error {
+func SetContainerImageFromRegistry(ctx context.Context, config *rest.Config, notebook *nbv1.Notebook, log logr.Logger, namespace string) error {
 	// Create a dynamic client
 	dynamicClient, err := dynamic.NewForConfig(config)
 	if err != nil {
 		log.Error(err, "Error creating dynamic client")
 		return err
-	}
-	// Specify the GroupVersionResource for imagestreams
-	ims := schema.GroupVersionResource{
-		Group:    "image.openshift.io",
-		Version:  "v1",
-		Resource: "imagestreams",
 	}
 
 	annotations := notebook.GetAnnotations()
@@ -565,79 +647,83 @@ func SetContainerImageFromRegistry(ctx context.Context, config *rest.Config, not
 					if strings.Contains(container.Image, "image-registry.openshift-image-registry.svc:5000") {
 						log.Info("Internal registry found. Will pick up the default value from image field.")
 						return nil
-					} else {
-						log.Info("No internal registry found, let's pick up image reference from relevant ImageStream 'status.tags[].tag.dockerImageReference'")
+					}
+					log.Info("No internal registry found, let's pick up image reference from relevant ImageStream 'status.tags[].tag.dockerImageReference'")
 
-						// Split the imageSelection to imagestream and tag
-						imageSelected := strings.Split(imageSelection, ":")
-						if len(imageSelected) != 2 {
-							log.Error(nil, "Invalid image selection format")
-							return fmt.Errorf("invalid image selection format")
+					// Split the imageSelection to imagestream and tag
+					imageSelected := strings.Split(imageSelection, ":")
+					if len(imageSelected) != 2 {
+						return fmt.Errorf("invalid image selection format")
+					}
+
+					// Specify the GroupVersionResource for imagestreams
+					ims := schema.GroupVersionResource{
+						Group:    "image.openshift.io",
+						Version:  "v1",
+						Resource: "imagestreams",
+					}
+
+					imagestreamFound := false
+					// List imagestreams in the specified namespace
+					imagestreams, err := dynamicClient.Resource(ims).Namespace(namespace).List(ctx, metav1.ListOptions{})
+					if err != nil {
+						if k8serr.IsForbidden(err) {
+							log.Info("Permission denied to list imagestreams", "namespace", namespace, "error", err)
+							// fast exit on permission denied
+							return err
 						}
+						log.Info("Cannot list imagestreams", "namespace", namespace, "error", err)
+						continue
+					}
 
-						// Specify the namespaces to search in
-						namespaces := []string{"opendatahub", "redhat-ods-applications"}
-						imagestreamFound := false
-						for _, namespace := range namespaces {
-							// List imagestreams in the specified namespace
-							imagestreams, err := dynamicClient.Resource(ims).Namespace(namespace).List(ctx, metav1.ListOptions{})
-							if err != nil {
-								log.Info("Cannot list imagestreams", "error", err)
-								continue
-							}
+					// Iterate through the imagestreams to find matches
+					for _, item := range imagestreams.Items {
+						metadata := item.Object["metadata"].(map[string]interface{})
+						name := metadata["name"].(string)
 
-							// Iterate through the imagestreams to find matches
-							for _, item := range imagestreams.Items {
-								metadata := item.Object["metadata"].(map[string]interface{})
-								name := metadata["name"].(string)
+						// Match with the ImageStream name
+						if name == imageSelected[0] {
+							status := item.Object["status"].(map[string]interface{})
 
-								// Match with the ImageStream name
-								if name == imageSelected[0] {
-									status := item.Object["status"].(map[string]interface{})
-
-									// Match to the corresponding tag of the image
-									tags := status["tags"].([]interface{})
-									for _, t := range tags {
-										tagMap := t.(map[string]interface{})
-										tagName := tagMap["tag"].(string)
-										if tagName == imageSelected[1] {
-											items := tagMap["items"].([]interface{})
-											if len(items) > 0 {
-												// Sort items by creationTimestamp to get the most recent one
-												sort.Slice(items, func(i, j int) bool {
-													iTime := items[i].(map[string]interface{})["created"].(string)
-													jTime := items[j].(map[string]interface{})["created"].(string)
-													return iTime > jTime // Lexicographical comparison of RFC3339 timestamps
-												})
-												imageHash := items[0].(map[string]interface{})["dockerImageReference"].(string)
-												// Update the Containers[i].Image value
-												notebook.Spec.Template.Spec.Containers[i].Image = imageHash
-												// Update the JUPYTER_IMAGE environment variable with the image selection for example "jupyter-datascience-notebook:2023.2"
-												for i, envVar := range container.Env {
-													if envVar.Name == "JUPYTER_IMAGE" {
-														container.Env[i].Value = imageSelection
-														break
-													}
+							// Match to the corresponding tag of the image
+							if tags, ok := status["tags"].([]interface{}); ok && tags != nil {
+								for _, t := range tags {
+									tagMap := t.(map[string]interface{})
+									tagName := tagMap["tag"].(string)
+									if tagName == imageSelected[1] {
+										items := tagMap["items"].([]interface{})
+										if len(items) > 0 {
+											// Sort items by creationTimestamp to get the most recent one
+											sort.Slice(items, func(i, j int) bool {
+												iTime := items[i].(map[string]interface{})["created"].(string)
+												jTime := items[j].(map[string]interface{})["created"].(string)
+												return iTime > jTime // Lexicographical comparison of RFC3339 timestamps
+											})
+											imageHash := items[0].(map[string]interface{})["dockerImageReference"].(string)
+											// Update the Containers[i].Image value
+											notebook.Spec.Template.Spec.Containers[i].Image = imageHash
+											// Update the JUPYTER_IMAGE environment variable with the image selection for example "jupyter-datascience-notebook:2023.2"
+											for i, envVar := range container.Env {
+												if envVar.Name == "JUPYTER_IMAGE" {
+													container.Env[i].Value = imageSelection
+													break
 												}
-												imagestreamFound = true
-												break
 											}
+											imagestreamFound = true
+											break
 										}
 									}
 								}
 							}
-							if imagestreamFound {
-								break
-							}
 						}
-						if !imagestreamFound {
-							log.Error(nil, "Imagestream not found in any of the specified namespaces", "imageSelected", imageSelected[0], "tag", imageSelected[1])
-						}
+					}
+					if !imagestreamFound {
+						log.Error(nil, "Imagestream not found in main controller namespace", "imageSelected", imageSelected[0], "tag", imageSelected[1], "namespace", namespace)
 					}
 				}
 			}
 			if !containerFound {
-				log.Error(nil, "No container found matching the notebook name", "notebookName", notebook.Name)
+				return fmt.Errorf("no container found matching the notebook name %s", notebook.Name)
 			}
 		}
 	}

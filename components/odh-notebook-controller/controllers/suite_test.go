@@ -18,7 +18,9 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"k8s.io/utils/ptr"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -55,17 +57,21 @@ import (
 // +kubebuilder:docs-gen:collapse=Imports
 
 var (
-	cfg            *rest.Config
-	cli            client.Client
-	envTest        *envtest.Environment
+	cfg     *rest.Config
+	cli     client.Client
+	envTest *envtest.Environment
+
 	ctx            context.Context
 	cancel         context.CancelFunc
+	managerStopped = make(chan struct{})
+
 	testNamespaces = []string{}
 )
 
 const (
-	timeout  = time.Second * 10
-	interval = time.Second * 2
+	timeout                            = time.Second * 10
+	interval                           = time.Second * 2
+	odhNotebookControllerTestNamespace = "redhat-ods-applications"
 )
 
 func TestAPIs(t *testing.T) {
@@ -74,7 +80,7 @@ func TestAPIs(t *testing.T) {
 }
 
 var _ = BeforeSuite(func() {
-	ctx, cancel = context.WithCancel(context.TODO())
+	ctx, cancel = context.WithCancel(context.Background())
 
 	// Initialize logger
 	opts := zap.Options{
@@ -83,10 +89,13 @@ var _ = BeforeSuite(func() {
 	}
 	logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseFlagOptions(&opts)))
 
-	// Initiliaze test environment:
+	// Initialize test environment:
 	// https://pkg.go.dev/sigs.k8s.io/controller-runtime/pkg/envtest#Environment.Start
 	By("Bootstrapping test environment")
 	envTest = &envtest.Environment{
+		ControlPlane: envtest.ControlPlane{
+			APIServer: &envtest.APIServer{},
+		},
 		CRDInstallOptions: envtest.CRDInstallOptions{
 			Paths:              []string{filepath.Join("..", "config", "crd", "external")},
 			ErrorIfPathMissing: true,
@@ -97,10 +106,38 @@ var _ = BeforeSuite(func() {
 			IgnoreErrorIfPathMissing: false,
 		},
 	}
+	if auditLogPath, found := os.LookupEnv("DEBUG_WRITE_AUDITLOG"); found {
+		envTest.ControlPlane.APIServer.Configure().
+			// https://kubernetes.io/docs/tasks/debug/debug-cluster/audit/#log-backend
+			Append("audit-log-maxage", "1").
+			Append("audit-log-maxbackup", "5").
+			Append("audit-log-maxsize", "100"). // in MiB
+			Append("audit-log-format", "json").
+			Append("audit-policy-file", filepath.Join("..", "envtest-audit-policy.yaml")).
+			Append("audit-log-path", auditLogPath)
+		GinkgoT().Logf("DEBUG_WRITE_AUDITLOG is set, writing `envtest-audit-policy.yaml` auditlog to %s", auditLogPath)
+	} else {
+		GinkgoT().Logf("DEBUG_WRITE_AUDITLOG environment variable was not provided")
+	}
 
-	cfg, err := envTest.Start()
+	var err error
+	cfg, err = envTest.Start()
 	Expect(err).NotTo(HaveOccurred())
 	Expect(cfg).NotTo(BeNil())
+
+	if kubeconfigPath, found := os.LookupEnv("DEBUG_WRITE_KUBECONFIG"); found {
+		// https://github.com/rancher/fleet/blob/main/integrationtests/utils/kubeconfig.go
+		user := envtest.User{Name: "MasterOfTheSystems", Groups: []string{"system:masters"}}
+		authedUser, err := envTest.ControlPlane.AddUser(user, nil)
+		Expect(err).NotTo(HaveOccurred())
+		config, err := authedUser.KubeConfig()
+		Expect(err).NotTo(HaveOccurred())
+		err = os.WriteFile(kubeconfigPath, config, 0600)
+		Expect(err).NotTo(HaveOccurred())
+		GinkgoT().Logf("DEBUG_WRITE_KUBECONFIG is set, writing system:masters' Kubeconfig to %s", kubeconfigPath)
+	} else {
+		GinkgoT().Logf("DEBUG_WRITE_KUBECONFIG environment variable was not provided")
+	}
 
 	// Register API objects
 	scheme := runtime.NewScheme()
@@ -110,7 +147,7 @@ var _ = BeforeSuite(func() {
 	utilruntime.Must(netv1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 
-	// Initiliaze Kubernetes client
+	// Initialize Kubernetes client
 	cli, err = client.New(cfg, client.Options{Scheme: scheme})
 	Expect(err).NotTo(HaveOccurred())
 	Expect(cli).NotTo(BeNil())
@@ -126,14 +163,21 @@ var _ = BeforeSuite(func() {
 			Port:    webhookInstallOptions.LocalServingPort,
 			CertDir: webhookInstallOptions.LocalServingCertDir,
 		}),
+		// Issue#429: waiting in tests only wastes time and prints pointless context-cancelled errors
+		GracefulShutdownTimeout: ptr.To(time.Duration(0)),
+		// pass in test context because why not
+		BaseContext: func() context.Context {
+			return ctx
+		},
 	})
 	Expect(err).NotTo(HaveOccurred())
 
 	// Setup notebook controller
 	err = (&OpenshiftNotebookReconciler{
-		Client: mgr.GetClient(),
-		Log:    ctrl.Log.WithName("controllers").WithName("notebook-controller"),
-		Scheme: mgr.GetScheme(),
+		Client:    mgr.GetClient(),
+		Log:       ctrl.Log.WithName("controllers").WithName("notebook-controller"),
+		Scheme:    mgr.GetScheme(),
+		Namespace: odhNotebookControllerTestNamespace,
 	}).SetupWithManager(mgr)
 	Expect(err).ToNot(HaveOccurred())
 
@@ -141,9 +185,10 @@ var _ = BeforeSuite(func() {
 	hookServer := mgr.GetWebhookServer()
 	notebookWebhook := &webhook.Admission{
 		Handler: &NotebookWebhook{
-			Log:    ctrl.Log.WithName("controllers").WithName("notebook-controller"),
-			Client: mgr.GetClient(),
-			Config: mgr.GetConfig(),
+			Log:       ctrl.Log.WithName("controllers").WithName("notebook-controller"),
+			Client:    mgr.GetClient(),
+			Config:    mgr.GetConfig(),
+			Namespace: odhNotebookControllerTestNamespace,
 			OAuthConfig: OAuthConfig{
 				ProxyImage: OAuthProxyImage,
 			},
@@ -156,6 +201,7 @@ var _ = BeforeSuite(func() {
 	go func() {
 		defer GinkgoRecover()
 		err = mgr.Start(ctx)
+		managerStopped <- struct{}{}
 		Expect(err).ToNot(HaveOccurred(), "Failed to run manager")
 	}()
 
@@ -172,7 +218,6 @@ var _ = BeforeSuite(func() {
 	}).Should(Succeed())
 
 	// Verify kubernetes client is working
-	cli = mgr.GetClient()
 	Expect(cli).ToNot(BeNil())
 
 	for _, namespace := range testNamespaces {
@@ -187,7 +232,10 @@ var _ = BeforeSuite(func() {
 }, 60)
 
 var _ = AfterSuite(func() {
+	By("Stopping the manager")
 	cancel()
+	<-managerStopped // Issue#429: waiting to avoid shutdown errors being logged
+
 	By("Tearing down the test environment")
 	// TODO: Stop cert controller-runtime.certwatcher before manager
 	err := envTest.Stop()

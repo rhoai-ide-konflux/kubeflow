@@ -1,10 +1,12 @@
 
+include makefile-vars.mk
+
 # Image URL to use all building/pushing image targets
 IMG ?= quay.io/opendatahub/odh-notebook-controller
 TAG ?= $(shell git describe --tags --always)
 
 KF_IMG ?= quay.io/opendatahub/kubeflow-notebook-controller
-KF_TAG ?= main-363bcdb
+KF_TAG ?= $(KF_TAG)
 
 CONTAINER_ENGINE ?= podman
 
@@ -92,12 +94,12 @@ test-with-rbac-false: manifests generate fmt vet envtest ## Run tests.
 	export SET_PIPELINE_RBAC=false && \
 	ACK_GINKGO_DEPRECATIONS=1.16.5 \
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" \
-		go test ./controllers/... -ginkgo.v -ginkgo.progress -test.v -coverprofile cover.out
+		go test ./controllers/... -ginkgo.v -ginkgo.progress -test.v -coverprofile cover-rbac-false.out
 test-with-rbac-true: manifests generate fmt vet envtest ## Run tests.
 	export SET_PIPELINE_RBAC=true && \
 	ACK_GINKGO_DEPRECATIONS=1.16.5 \
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" \
-		go test ./controllers/... -ginkgo.v -ginkgo.progress -test.v -coverprofile cover.out
+		go test ./controllers/... -ginkgo.v -ginkgo.progress -test.v -coverprofile cover-rbac-true.out
 
 ##@ Build
 
@@ -132,16 +134,13 @@ endif
 setup-kf: kustomize ## Replace Kustomize manifests with your environment configuration.
 	sed -i'' -e 's,namespace: .*,namespace: '"${K8S_NAMESPACE}"',' \
 		../notebook-controller/config/overlays/openshift/kustomization.yaml
-	sed -i'' -e 's,newName: .*,newName: '"${KF_IMG}"',' \
-		../notebook-controller/config/overlays/openshift/kustomization.yaml
-	sed -i'' -e 's,newTag: .*,newTag: '"${KF_TAG}"',' \
- 	../notebook-controller/config/overlays/openshift/kustomization.yaml
+	sed -i'' -e "s,odh-kf-notebook-controller-image=.*,odh-kf-notebook-controller-image=${KF_IMG}:${KF_TAG}," \
+		../notebook-controller/config/overlays/openshift/params.env
 
 .PHONY: setup
 setup: manifests kustomize ## Replace Kustomize manifests with your environment configuration.
 	sed -i'' -e 's,namespace: .*,namespace: '"${K8S_NAMESPACE}"',' ./config/default/kustomization.yaml
-	sed -i'' -e 's,newName: .*,newName: '"${IMG}"',' ./config/base/kustomization.yaml
-	sed -i'' -e 's,newTag: .*,newTag: '"${TAG}"',' ./config/base/kustomization.yaml
+	sed -i'' -e "s,odh-notebook-controller-image=.*,odh-notebook-controller-image=${IMG}:${TAG}," ./config/base/params.env
 
 .PHONY: setup-service-mesh
 setup-service-mesh: kustomize ## Replace Kustomize manifests with your environment configuration.
@@ -151,10 +150,8 @@ setup-service-mesh: kustomize ## Replace Kustomize manifests with your environme
 		../notebook-controller/config/overlays/standalone-service-mesh/kustomization.yaml
 	sed -i'' -e 's,ISTIO_GATEWAY=.*,ISTIO_GATEWAY='"${K8S_NAMESPACE}/odh-gateway"',' \
     		../notebook-controller/config/overlays/standalone-service-mesh/kustomization.yaml
-	sed -i'' -e 's,newName: .*,newName: '"${KF_IMG}"',' \
-		../notebook-controller/config/overlays/standalone-service-mesh/kustomization.yaml
-	sed -i'' -e 's,newTag: .*,newTag: '"${KF_TAG}"',' \
-	../notebook-controller/config/overlays/standalone-service-mesh/kustomization.yaml
+	sed -i'' -e "s,odh-kf-notebook-controller-image=.*,odh-kf-notebook-controller-image=${KF_IMG}:${KF_TAG}," \
+		../notebook-controller/config/overlays/openshift/params.env
 	sed -i'' -e 's,host: .*,host: opendatahub.'"$(shell kubectl get ingress.config.openshift.io cluster -o 'jsonpath={.spec.domain}')"',' \
     	../notebook-controller/config/overlays/standalone-service-mesh/gateway-route.yaml
 

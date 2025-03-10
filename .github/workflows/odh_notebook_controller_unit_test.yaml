@@ -2,7 +2,11 @@ name: Run ODH Notebook Controller unit tests
 on:
   push:
   pull_request:
+    branches:
+      - main
+      - v1.9-branch
     paths:
+      - .github/workflows/odh_notebook_controller_unit_test.yaml
       - components/odh-notebook-controller/**
   workflow_dispatch:
 
@@ -24,3 +28,10 @@ jobs:
       run: |
         cd components/odh-notebook-controller
         make test
+
+    - name: Upload results to Codecov
+      uses: codecov/codecov-action@v5
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        files: ./components/odh-notebook-controller/cover-rbac-false.out,./components/odh-notebook-controller/cover-rbac-true.out
+        disable_search: true
